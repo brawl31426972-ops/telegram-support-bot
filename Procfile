@@ -1,2 +1,1 @@
-web: gunicorn keep_alive:app
-bot: python main.py
+web: python3 main.py
