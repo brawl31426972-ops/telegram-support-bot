@@ -1,175 +1,237 @@
 import os
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart, Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 import asyncio
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import (
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+)
 
-from keep_alive import keep_alive
+TOKEN = os.environ.get("TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID"))
 
-# Owner TG ID
-OWNER_ID = 6923254118
-
-# Token from environment (Scalingo)
-TOKEN = os.environ["TOKEN"]
-
-bot = Bot(token=TOKEN)
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
-# Active user sessions
-active_sessions = {}  # user_id → "active"
-cases = {}            # case_id → user_id
-case_counter = 0
+active_sessions = {}
+cases = {}
+reverse_cases = {}
+active_case_for_owner = None
 
 
-# ---------------------- MENU KEYBOARD ----------------------
 def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📞 Call", callback_data="call")]
-    ])
-
-
-# ---------------------- /start ----------------------
-@dp.message(CommandStart())
-async def start_cmd(message: Message):
-    await message.answer(
-        "👋 <b>Welcome!</b>\n\n"
-        "Это бот для связи.\n"
-        "Нажмите кнопку ниже, чтобы начать диалог.",
-        reply_markup=main_menu(),
-        parse_mode="HTML"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="/call")],
+            [KeyboardButton(text="/stop")]
+        ],
+        resize_keyboard=True
     )
 
 
-# ---------------------- USER PRESSES CALL ----------------------
-@dp.callback_query(lambda c: c.data == "call")
-async def user_call(callback):
-    global case_counter
+def admin_menu():
+    kb = []
+    for case_id in cases:
+        kb.append([KeyboardButton(text=f"case_{case_id}")])
 
-    user_id = callback.from_user.id
-    username = callback.from_user.username
+    if not kb:
+        kb = [[KeyboardButton(text="Нет активных кейсов")]]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+
+@dp.message(F.text == "/start")
+async def start(message: Message):
+    await message.answer(
+        "<b>Добро пожаловать!</b>\n"
+        "/call — начать диалог\n"
+        "/stop — завершить",
+        reply_markup=main_menu()
+    )
+
+
+@dp.message(F.text == "/call")
+async def call(message: Message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    if user_id == OWNER_ID:
+        await message.answer("Вы владелец", reply_markup=admin_menu())
+        return
 
     if user_id in active_sessions:
-        await callback.answer("Вы уже в диалоге!", show_alert=True)
+        await message.answer("У вас уже есть активный диалог.")
         return
 
-    case_counter += 1
-    case_id = case_counter
+    case_id = len(cases) + 1
 
-    active_sessions[user_id] = case_id
+    active_sessions[user_id] = True
     cases[case_id] = user_id
+    reverse_cases[user_id] = case_id
 
-    # Inform user
-    await bot.send_message(
-        user_id,
-        f"📞 Диалог <b>открыт</b>!\n"
-        f"Теперь вы можете писать сообщение.\n"
-        f"Отправьте /stop чтобы завершить.",
-        parse_mode="HTML"
+    user_display = f"@{username}" if username else f"<code>{user_id}</code>"
+
+    await message.answer(
+        "Диалог открыт! Пишите сообщения.",
+        reply_markup=main_menu()
     )
 
-    # Inform owner
     await bot.send_message(
         OWNER_ID,
-        f"🆕 <b>Новый кейс #{case_id}</b>\n"
-        f"ID: <code>{user_id}</code>\n"
-        f"Username: @{username if username else 'нет'}",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text=f"Открыть кейс #{case_id}", callback_data=f"case_{case_id}")]
-            ]
-        )
+        f"📩 Новый кейс #{case_id}\nПользователь: {user_display}",
+        reply_markup=admin_menu()
     )
 
-    await callback.answer()
 
-
-# ---------------------- OWNER PRESSES CASE BUTTON ----------------------
-@dp.callback_query(lambda c: c.data.startswith("case_"))
-async def owner_open_case(callback):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    case_id = int(callback.data.split("_")[1])
-    user_id = cases.get(case_id)
-
-    if not user_id:
-        await callback.answer("Кейс уже закрыт", show_alert=True)
-        return
-
-    await callback.message.answer(
-        f"🗂 <b>Вы отвечаете пользователю:</b> <code>{user_id}</code>\n"
-        f"Напишите сообщение — оно уйдет пользователю.",
-        parse_mode="HTML"
-    )
-
-    await callback.answer()
-
-
-# ---------------------- USER SENDS MESSAGE TO OWNER ----------------------
-@dp.message()
-async def message_router(message: Message):
-    user_id = message.from_user.id
-
-    # --- If user is talking to owner ---
-    if user_id in active_sessions and user_id != OWNER_ID:
-        case_id = active_sessions[user_id]
-
-        # Forward text / media to owner
-        if message.text:
-            await bot.send_message(
-                OWNER_ID,
-                f"📩 <b>Сообщение из кейса #{case_id}</b>\n"
-                f"<code>{user_id}</code>:\n{message.text}",
-                parse_mode="HTML"
-            )
-        else:
-            await message.forward(OWNER_ID)
-
-        # Auto-reply to user
-        await message.answer("Сообщение отправлено! Ожидайте ответа.")
-        return
-
-    # --- If owner is replying to a case ---
-    if user_id == OWNER_ID and message.reply_to_message:
-        original_text = message.reply_to_message.text
-        if "кейс #" in original_text:
-            # Extract the case ID
-            case_id = int(original_text.split("кейс #")[1].split("<")[0])
-            target = cases.get(case_id)
-
-            if target:
-                if message.text:
-                    await bot.send_message(target, f"💬 Ответ владельца:\n{message.text}")
-                else:
-                    await message.copy_to(target)
-        return
-
-
-# ---------------------- /stop ----------------------
-@dp.message(Command("stop"))
-async def stop_dialog(message: Message):
+@dp.message(F.text == "/stop")
+async def stop(message: Message):
     user_id = message.from_user.id
 
     if user_id not in active_sessions:
-        await message.answer("Вы не в диалоге.")
+        await message.answer("У вас нет активного диалога.")
         return
 
-    case_id = active_sessions[user_id]
+    case_id = reverse_cases[user_id]
 
-    # Remove case
     del active_sessions[user_id]
+    del reverse_cases[user_id]
     del cases[case_id]
 
-    await message.answer("Диалог завершен. Вы вернулись в меню.", reply_markup=main_menu())
+    await message.answer("Диалог завершён.", reply_markup=main_menu())
+    await bot.send_message(OWNER_ID, f"❌ Кейс #{case_id} закрыт.", reply_markup=admin_menu())
 
-    await bot.send_message(OWNER_ID, f"❌ Кейс #{case_id} закрыт пользователем.")
+
+@dp.message(F.text.regexp(r"case_\d+"))
+async def open_case(message: Message):
+    global active_case_for_owner
+    if message.from_user.id != OWNER_ID:
+        return
+
+    case_id = int(message.text.split("_")[1])
+    if case_id not in cases:
+        await message.answer("Кейс уже закрыт.", reply_markup=admin_menu())
+        return
+
+    active_case_for_owner = cases[case_id]
+    await message.answer(
+        f"Открыт кейс #{case_id}\nПользователь: <code>{active_case_for_owner}</code>",
+        reply_markup=admin_menu()
+    )
 
 
-# ---------------------- RUN ----------------------
+# ---------- OWNER replies ----------
+@dp.message(F.from_user.id == OWNER_ID)
+async def owner_reply(message: Message):
+    global active_case_for_owner
+
+    if not active_case_for_owner:
+        await message.answer("Выберите кейс.", reply_markup=admin_menu())
+        return
+
+    # TEXT
+    if message.text:
+        await bot.send_message(active_case_for_owner, f"✉ Сообщение владельца:\n{message.text}")
+        return
+
+    # PHOTO
+    if message.photo:
+        await bot.send_photo(active_case_for_owner, message.photo[-1].file_id, caption=message.caption or "")
+        return
+
+    # VIDEO
+    if message.video:
+        await bot.send_video(active_case_for_owner, message.video.file_id, caption=message.caption or "")
+        return
+
+    # DOCUMENT
+    if message.document:
+        await bot.send_document(active_case_for_owner, message.document.file_id, caption=message.caption or "")
+        return
+
+    # AUDIO
+    if message.audio:
+        await bot.send_audio(active_case_for_owner, message.audio.file_id, caption=message.caption or "")
+        return
+
+    # STICKER
+    if message.sticker:
+        await bot.send_sticker(active_case_for_owner, message.sticker.file_id)
+        return
+
+
+# ---------- USER messages ----------
+@dp.message()
+async def user_message(message: Message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+
+    if user_id == OWNER_ID:
+        return
+
+    if user_id not in active_sessions:
+        return
+
+    case_id = reverse_cases[user_id]
+    user_display = f"@{username}" if username else f"<code>{user_id}</code>"
+
+    # TEXT
+    if message.text:
+        await bot.send_message(
+            OWNER_ID,
+            f"📨 Кейс #{case_id}\nОт {user_display}:\n{message.text}",
+            reply_markup=admin_menu()
+        )
+        await message.answer("Отправлено.")
+        return
+
+    # PHOTO
+    if message.photo:
+        await bot.send_photo(
+            OWNER_ID, message.photo[-1].file_id,
+            caption=f"📷 Фото из кейса #{case_id}\nОт {user_display}"
+        )
+        await message.answer("Фото доставлено.")
+        return
+
+    # VIDEO
+    if message.video:
+        await bot.send_video(
+            OWNER_ID, message.video.file_id,
+            caption=f"📹 Видео из кейса #{case_id}\nОт {user_display}"
+        )
+        await message.answer("Видео доставлено.")
+        return
+
+    # DOCUMENT
+    if message.document:
+        await bot.send_document(
+            OWNER_ID, message.document.file_id,
+            caption=f"📄 Документ из кейса #{case_id}\nОт {user_display}"
+        )
+        await message.answer("Документ доставлен.")
+        return
+
+    # AUDIO
+    if message.audio:
+        await bot.send_audio(
+            OWNER_ID, message.audio.file_id,
+            caption=f"🎵 Аудио из кейса #{case_id}\nОт {user_display}"
+        )
+        await message.answer("Аудио доставлено.")
+        return
+
+    # STICKER
+    if message.sticker:
+        await bot.send_sticker(OWNER_ID, message.sticker.file_id)
+        await message.answer("Стикер доставлен.")
+        return
+
+
 async def main():
-    keep_alive()  # Start flask server
+    print("Бот запущен!")
     await dp.start_polling(bot)
 
 
